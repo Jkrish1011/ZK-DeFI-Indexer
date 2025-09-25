@@ -14,7 +14,7 @@ ZK DeFi Indexer for Uniswap v3 on Arbitrum (Nitro), written in Rust. The indexer
 
 ```mermaid
 flowchart LR
-  A[L1 Ethereum] --> B[Arbitrum Inbox/Sequencer<br/>Batch Event]
+  A[L1 Ethereum] --> B[Arbitrum Inbox/Sequencer Batch Event]
   B --> C[Indexer (Rust + Alloy)]
   C --> D[Decompress (Brotli) & Parse Nitro Batch]
   D --> E[Extract L2 Transactions]
