@@ -10,20 +10,6 @@ ZK DeFi Indexer for Uniswap v3 on Arbitrum (Nitro), written in Rust. The indexer
 - Serve data via Axum HTTP API; later power a simple Next.js explorer
 - Handle reorgs and idempotent ingestion
 
-## High-level architecture
-
-```mermaid
-flowchart LR
-  A[L1 Ethereum] --> B[Arbitrum Inbox/Sequencer Batch Event]
-  B --> C[Indexer (Rust + Alloy)]
-  C --> D[Decompress (Brotli) & Parse Nitro Batch]
-  D --> E[Extract L2 Transactions]
-  E --> F[Filter/Decode Uniswap v3 Calls]
-  F --> G[Normalize & Store (Postgres)]
-  G --> H[Axum API]
-  H --> I[Next.js Explorer(TBD)]
-```
-
 ## Current status (MVP slice implemented)
 
 - `indexer-rs/src/main.rs` connects to an Ethereum WebSocket endpoint (e.g., Alchemy/Infura) via Alloy and subscribes to logs for a configured Arbitrum contract address. Incoming logs are printed for development and validation.
