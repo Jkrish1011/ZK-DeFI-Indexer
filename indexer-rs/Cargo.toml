@@ -1,0 +1,21 @@
+[package]
+name = "indexer-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy = { version = "1.0.36", features = ["full"] }
+async-trait = "0.1.89"
+chrono = "0.4.42"
+dotenv = "0.15.0"
+env_logger = "0.11.8"
+eyre = "0.6.12"
+futures = "0.3.31"
+futures-util = "0.3.31"
+hex = "0.4.3"
+log = "0.4.28"
+rand = "0.9.2"
+reqwest = "0.12.23"
+serde = "1.0.226"
+serde_json = "1.0.145"
+tokio = { version = "1.47.1", features = ["full"] }
