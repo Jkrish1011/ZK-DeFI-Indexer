@@ -4,7 +4,7 @@ use alloy::{
     network::{EthereumWallet, TransactionBuilder, NetworkWallet},
     providers::{Provider, ProviderBuilder, WsConnect},
     primitives::{address, U256, hex, B256,Log as ETHLog, LogData, FixedBytes, Address},
-    rpc::types::{Filter,Log, TransactionRequest, BlockNumberOrTag},
+    rpc::types::{Filter, Log, TransactionRequest, BlockNumberOrTag},
     signers::local::LocalSigner,
     sol
 };
@@ -35,6 +35,39 @@ sol! {
     "src/abi/ARBITRUM.json"
 }
 
+sol! {
+    #[derive(Debug)]
+    struct TimeBounds {
+        uint64 minTimestamp;
+        uint64 maxTimestamp;
+        uint64 minBlockNumber;
+        uint64 maxBlockNumber;
+    }
+
+    #[derive(Debug)]
+    enum BatchDataLocation {
+        /// @notice The data can be found in the transaction call data
+        TxInput,
+        /// @notice The data can be found in an event emitted during the transaction
+        SeparateBatchEvent,
+        /// @notice This batch contains no data
+        NoData,
+        /// @notice The data can be found in the 4844 data blobs on this transaction
+        Blob
+    }
+
+    #[derive(Debug)]
+    event SequencerBatchDelivered(
+        uint256 indexed batchSequenceNumber,
+        bytes32 indexed beforeAcc,
+        bytes32 indexed afterAcc,
+        bytes32 delayedAcc,
+        uint256 afterDelayedMessagesRead,
+        TimeBounds timeBounds,
+        BatchDataLocation dataLocation
+    );
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,7 +76,8 @@ async fn main() -> Result<()> {
         .expect("ETHEREUM_MAINNET_WSS_URL must be set in .env");
     let arbitrum_contract = env::var("ARBITRUM_CONTRACT_ADDRESS")
         .expect("ARBITRUM_CONTRACT_ADDRESS must be set in .env");
-    println!("Connecting to Alchemy: {alchemy_url:?}");
+        let arbitrum_sequencer_inbox_contract = env::var("ARBITRUM_SEQUENCER_INBOX_CONTRACT")
+        .expect("ARBITRUM_SEQUENCER_INBOX_CONTRACT must be set in .env");    
 
     // Create WebSocket connection
     let ws = WsConnect::new(alchemy_url);
@@ -60,10 +94,14 @@ async fn main() -> Result<()> {
         .parse()
         .expect("ARBITRUM_CONTRACT_ADDRESS must be a valid 0x-prefixed address");
 
+    let arbitrum_sequencer_inbox_address: Address = arbitrum_sequencer_inbox_contract
+        .parse()
+        .expect("ARBITRUM_SEQUENCER_INBOX_CONTRACT must be a valid 0x-prefixed address");
+
     let filter = Filter::new()
         // By NOT specifying an `event` or `event_signature` we listen to ALL events of the
         // contract.
-        .address(arbitrum_address)
+        .address(arbitrum_sequencer_inbox_address)
         .from_block(BlockNumberOrTag::Latest);
 
     // Subscribe to logs.
@@ -71,48 +109,26 @@ async fn main() -> Result<()> {
     let mut stream = sub.into_stream();
 
     while let Some(log) = stream.next().await {
-        // Match on topic 0, the hash of the signature of the event.
-        println!("Received log: {:?}", log);
+        // Only attempt to decode if topic0 matches the SequencerBatchDelivered signature.
+        if let Some(topic0) = log.topics().get(0) {
+            if topic0 == &SequencerBatchDelivered::SIGNATURE_HASH {
+                match SequencerBatchDelivered::decode_log(&log.inner) {
+                    Ok(event) => {
+                        println!("Received SequencerBatchDelivered event: {:#?}", event);
+                    }
+                    Err(e) => {
+                        // This can still fail if the ABI or indexing expectations differ.
+                        println!("Failed to decode SequencerBatchDelivered event: {:#?}", e);
+                    }
+                }
+            } else {
+                // event not in consideration
+                // println!("Skipped non-target event with topic0: {:#?}", topic0);
+            }
+        } else {
+            println!("Received log without topics: {:#?}", log);
+        }
     }
-
-
-    // // Subscribe to block headers.
-    // let subscription = provider.subscribe_blocks().await?;
-    // let mut stream = subscription.into_stream().take(2);
-
-    // while let Some(header) = stream.next().await {
-    //     println!("Received block number: {}", header.number);
-    // }
-
-    // Subscribe to new block headers
-    // let sub = provider.subscribe_blocks().await?;
-    // let mut stream = sub.into_stream();
-
-    // // Process incoming blocks
-    // while let Some(block_header) = stream.next().await {
-    //     println!("\n🔗 New Block: #{}", block_header.number.unwrap_or(0));
-        
-    //     // Get full block with transactions
-    //     if let Some(full_block) = provider
-    //         .get_block(true.into())
-    //         .await? 
-    //     {
-    //         println!("Transactions in block: {}", full_block.transactions.len());
-            
-    //         // Filter for potential Uniswap/Arbitrum transactions
-    //         for tx in &full_block.transactions {
-    //             if let Some(to_address) = &tx.to {
-    //                 // Add your Uniswap/Arbitrum contract addresses here
-    //                 let uniswap_v3_router = arbitrum_contract;
-                    
-    //                 if format!("{:?}", to_address).to_lowercase() == uniswap_v3_router.to_lowercase() {
-    //                     println!("  📊 Potential Uniswap transaction: {:?}", tx.hash);
-    //                     // Add your transaction analysis logic here
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 
     Ok(())
 }
