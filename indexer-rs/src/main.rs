@@ -27,6 +27,8 @@ use std::str::FromStr;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{sync::RwLock, time};
 use serde::{Deserialize, Serialize};
+use reqwest::{Error, Client};
+use brotli::Decompressor;
 
 sol! {
     #[allow(missing_docs)]
@@ -68,6 +70,13 @@ sol! {
     );
 }
 
+fn calculate_slot_number(blockNumber: u64) -> u64 {
+    // const slot = Math.floor((timestamp - 1663224000) / 12) + 4700013;
+    let slot = (blockNumber - 15537394) + 4700013;
+    println!("slot: {}", &slot.to_string());
+    slot
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,17 +85,20 @@ async fn main() -> Result<()> {
         .expect("ETHEREUM_MAINNET_WSS_URL must be set in .env");
     let arbitrum_contract = env::var("ARBITRUM_CONTRACT_ADDRESS")
         .expect("ARBITRUM_CONTRACT_ADDRESS must be set in .env");
-        let arbitrum_sequencer_inbox_contract = env::var("ARBITRUM_SEQUENCER_INBOX_CONTRACT")
-        .expect("ARBITRUM_SEQUENCER_INBOX_CONTRACT must be set in .env");    
+    let arbitrum_sequencer_inbox_contract = env::var("ARBITRUM_SEQUENCER_INBOX_CONTRACT")
+        .expect("ARBITRUM_SEQUENCER_INBOX_CONTRACT must be set in .env");
+
+    let blobscan_api = env::var("BLOBSCAN_API")
+        .expect("BLOBSCAN_API must be set in .env");
 
     // Create WebSocket connection
-    let ws = WsConnect::new(alchemy_url);
+    let ws = WsConnect::new(&alchemy_url);
     
     // Create provider with WebSocket transport
     let provider = ProviderBuilder::new()
-        .on_ws(ws)
+        .connect_ws(ws)
         .await?;
-
+    
     println!("Connected! Subscribing to new blocks...");
 
     // Parse the string (expects a 0x-prefixed hex address)
@@ -114,7 +126,27 @@ async fn main() -> Result<()> {
             if topic0 == &SequencerBatchDelivered::SIGNATURE_HASH {
                 match SequencerBatchDelivered::decode_log(&log.inner) {
                     Ok(event) => {
-                        println!("Received SequencerBatchDelivered event: {:#?}", event);
+                        println!("Received SequencerBatchDelivered event: {:#?}", &event);
+                        println!("event.timeBounds.minBlockNumber: {}", event.timeBounds.minBlockNumber);
+                        
+                        let blobscanner_api = blobscan_api.clone().replace("BLOCK", event.timeBounds.minBlockNumber.to_string().as_str());
+                        let response = reqwest::get(&blobscanner_api).await?;
+                        let blob_data: serde_json::Value = response.json().await?;
+                        
+                        let blobs = blob_data.get("blobs").unwrap();
+
+                        for blob in blobs.as_array().unwrap() {
+                            let data_storage_ref = blob.get("dataStorageReferences").unwrap();
+                            println!("data_storage_ref: {:#?}", &data_storage_ref);
+                            let url = data_storage_ref.get(0).unwrap().get("url").unwrap().as_str().unwrap().to_string();
+                            println!("url: {}", &url);
+                            let response = reqwest::get(&url).await?;
+                            let blob_data: Vec<u8> = response.bytes().await?.to_vec();
+                            println!("blob_data: {:#?}", &blob_data[..64]);
+
+                            println!("trying to decompress the data using brotli");
+                        }
+
                     }
                     Err(e) => {
                         // This can still fail if the ABI or indexing expectations differ.
@@ -124,7 +156,7 @@ async fn main() -> Result<()> {
             } else {
                 // event not in consideration
                 // println!("Skipped non-target event with topic0: {:#?}", topic0);
-            }
+            } 
         } else {
             println!("Received log without topics: {:#?}", log);
         }
