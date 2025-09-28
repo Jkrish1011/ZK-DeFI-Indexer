@@ -2373,6 +2373,7 @@ dependencies = [
  "alloy",
  "async-trait",
  "brotli",
+ "c-kzg",
  "chrono",
  "dotenv",
  "env_logger",

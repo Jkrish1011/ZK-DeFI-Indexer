@@ -18,7 +18,7 @@ use chrono::format::Fixed;
 use hex as justHex;
 use std::fs::read_to_string;
 use rand::thread_rng;
-use std::path::PathBuf;
+use std::path::Path;
 use eyre::Result;
 use futures_util::StreamExt;
 use dotenv::dotenv;
@@ -29,6 +29,10 @@ use tokio::{sync::RwLock, time};
 use serde::{Deserialize, Serialize};
 use reqwest::{Error, Client};
 use brotli::Decompressor;
+use std::io::Read;
+use c_kzg::KzgSettings;
+use c_kzg::{Blob, KzgCommitment};
+
 
 sol! {
     #[allow(missing_docs)]
@@ -75,6 +79,74 @@ fn calculate_slot_number(blockNumber: u64) -> u64 {
     let slot = (blockNumber - 15537394) + 4700013;
     println!("slot: {}", &slot.to_string());
     slot
+}
+
+fn commitment_to_hex(commitment: &KzgCommitment) -> String {
+    format!("0x{}", justHex::encode(commitment.as_ref()))
+}
+
+fn compute_kzg_commitment(blob: &[u8]) -> Option<KzgCommitment> {
+    println!("Attempting KZG commitment computation on blob of size: {}", blob.len());
+    let setup_path = "trusted_setup.txt";
+
+    if !Path::new(setup_path).exists() {
+        println!("ERROR: trusted_setup.txt doesn't exists!");
+        return None;
+    }
+
+    let kzg_settings = match KzgSettings::load_trusted_setup_file(&Path::new(setup_path), 0) {
+        Ok(settings) => settings,
+        Err(e) => {
+            println!("ERROR:Failed to load trusted setup: {:?}", e);
+            return None;
+        }
+    };
+
+    // Prepare blob data - KZG expects exactly 131072 bytes (4096 field elements * 32 bytes each)
+    let required_size = 4096 * 32; // 131072 bytes
+    let blob_data = if blob.len() == required_size {
+        println!("Blob is already the correct size: {} bytes", required_size);
+        blob.to_vec()
+    } else if blob.len() < required_size {
+        println!("Blob is too small ({}), padding to {} bytes", blob.len(), required_size);
+        let mut padded = blob.to_vec();
+        padded.resize(required_size, 0);
+        padded
+    } else {
+        println!("Blob is too large ({}), truncating to {} bytes", blob.len(), required_size);
+        blob[..required_size].to_vec()
+    };
+
+    let blob_converted = match Blob::from_bytes(&blob_data) {
+        Ok(blob) => blob,
+        Err(e) => {
+            println!("ERROR:Failed to convert blob to KZG blob: {:?}", e);
+            return None;
+        }
+    };
+
+    let commitment: KzgCommitment = match kzg_settings.blob_to_kzg_commitment(&blob_converted) {
+        Ok(commitment) => {
+            let commitment_hex = commitment_to_hex(&commitment);
+            println!("commitment: {}", &commitment_hex);
+            commitment
+        },
+        Err(e) => {
+            println!("ERROR:Failed to compute KZG commitment: {:?}", e);
+            return None;
+        }
+    };
+    println!("KZG commitment computed successfully");
+    Some(commitment)
+}
+
+fn try_brotli_decompress(blob_data: &[u8]) -> Option<Vec<u8>> {
+    let mut decompressed = Vec::new();
+    let mut reader = Decompressor::new(blob_data, 4096);
+    match reader.read_to_end(&mut decompressed) {
+        Ok(_) => Some(decompressed),
+        Err(e) => None
+    }
 }
 
 
@@ -145,6 +217,26 @@ async fn main() -> Result<()> {
                             println!("blob_data: {:#?}", &blob_data[..64]);
 
                             println!("trying to decompress the data using brotli");
+
+                            match try_brotli_decompress(&blob_data) {
+                                Some(decompressed) => {
+                                    println!("Blob is Brotli compressed! Decompressed size: {}", decompressed.len());
+                                    println!("First 64 bytes (hex): {}", hex::encode(&decompressed[..64.min(decompressed.len())]));
+                                }
+                                None => {
+                                    println!("Blob is raw (not Brotli). First 64 bytes: {}", hex::encode(&blob_data[..64.min(blob_data.len())]));
+                                }
+                            }
+
+                            match compute_kzg_commitment(&blob_data) {
+                                Some(commitment) => {
+                                    println!("commitment: {:#?}", &commitment);
+                                    println!("Commitment from event: {}", blob.get("commitment").unwrap().as_str().unwrap());
+                                }
+                                None => {
+                                    println!("Failed to compute KZG commitment");
+                                }
+                            }
                         }
 
                     }

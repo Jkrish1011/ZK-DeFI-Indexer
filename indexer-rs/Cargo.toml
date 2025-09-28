@@ -7,6 +7,7 @@ edition = "2021"
 alloy = { version = "1.0.36", features = ["full"] }
 async-trait = "0.1.89"
 brotli = "8.0.2"
+c-kzg = "2.1.4"
 chrono = "0.4.42"
 dotenv = "0.15.0"
 env_logger = "0.11.8"
