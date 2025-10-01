@@ -54,6 +54,8 @@ use brotli::Decompressor;
 
 mod utils;
 
+use utils::helpers::save_bytes_to_file;
+
 sol! {
     #[allow(missing_docs)]
     #[sol(rpc)]
@@ -167,6 +169,99 @@ fn try_brotli_decompress(blob_data: &[u8]) -> Option<Vec<u8>> {
         Ok(_) => Some(decompressed),
         Err(e) => None
     }
+}
+
+// ---- RLP helpers: compute total length of the next RLP item and peel a stream ----
+fn rlp_item_total_len(input: &[u8]) -> Option<usize> {
+    if input.is_empty() {
+        return None;
+    }
+    let b0 = input[0];
+
+    match b0 {
+        0x00..=0x7f => Some(1), // single byte
+        0x80..=0xb7 => {
+            let len = (b0 - 0x80) as usize;
+            if input.len() < 1 + len { return None; }
+            Some(1 + len)
+        }
+        0xb8..=0xbf => {
+            let len_of_len = (b0 - 0xb7) as usize;
+            if input.len() < 1 + len_of_len { return None; }
+            let mut l: usize = 0;
+            for &byte in &input[1..1 + len_of_len] {
+                l = (l << 8) | (byte as usize);
+            }
+            if input.len() < 1 + len_of_len + l { return None; }
+            Some(1 + len_of_len + l)
+        }
+        0xc0..=0xf7 => {
+            let payload_len = (b0 - 0xc0) as usize;
+            if input.len() < 1 + payload_len { return None; }
+            Some(1 + payload_len)
+        }
+        0xf8..=0xff => {
+            let len_of_len = (b0 - 0xf7) as usize;
+            if input.len() < 1 + len_of_len { return None; }
+            let mut l: usize = 0;
+            for &byte in &input[1..1 + len_of_len] {
+                l = (l << 8) | (byte as usize);
+            }
+            if input.len() < 1 + len_of_len + l { return None; }
+            Some(1 + len_of_len + l)
+        }
+    }
+}
+
+// Peel the next RLP item as a byte-string, returning (payload_bytes, total_consumed)
+// Returns None if the input is malformed or the item is an RLP list (not a string/bytes).
+fn rlp_peel_string(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if input.is_empty() { return None; }
+    let b0 = input[0];
+    match b0 {
+        0x00..=0x7f => {
+            // single byte, payload is that byte
+            Some((vec![b0], 1))
+        }
+        0x80..=0xb7 => {
+            let len = (b0 - 0x80) as usize;
+            if input.len() < 1 + len { return None; }
+            let payload = input[1..1+len].to_vec();
+            Some((payload, 1 + len))
+        }
+        0xb8..=0xbf => {
+            let len_of_len = (b0 - 0xb7) as usize;
+            if input.len() < 1 + len_of_len { return None; }
+            let mut l: usize = 0;
+            for &byte in &input[1..1 + len_of_len] {
+                l = (l << 8) | (byte as usize);
+            }
+            if input.len() < 1 + len_of_len + l { return None; }
+            let start = 1 + len_of_len;
+            let payload = input[start..start + l].to_vec();
+            Some((payload, 1 + len_of_len + l))
+        }
+        0xc0..=0xff => {
+            // It's a list; Nitro segments are expected to be byte-strings.
+            None
+        }
+    }
+}
+
+// Try to decode a concatenated stream of RLP items, returning each item's byte-string payload.
+// If any item is not a byte-string or parsing fails, return None.
+fn try_decode_rlp_segments(input: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = input;
+    while !cursor.is_empty() {
+        let (payload, consumed) = match rlp_peel_string(cursor) {
+            Some(v) => v,
+            None => return None,
+        };
+        out.push(payload);
+        cursor = &cursor[consumed..];
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 
@@ -298,6 +393,162 @@ fn extract_payload_from_4844_blob(blob: &[u8]) -> Result<Vec<u8>> {
     }
 
     return Ok(blob[8..8 + size as usize].to_vec());
+}
+
+fn decode_nitro_batch(batch: &[u8]) -> eyre::Result<()> {
+    if let Some(segments) = try_decode_rlp_segments(batch) {
+        println!("Decoded {} segments from Nitro batch", segments.len());
+        handle_segments(segments)?;
+        Ok(())
+    } else {
+        eyre::bail!("Failed to decode RLP segments from Nitro batch");
+    }
+}
+
+fn handle_segments(segments: Vec<Vec<u8>>) -> eyre::Result<()> {
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            println!("Segment {} is empty, skipping", i);
+            continue;
+        }
+        let kind = seg[0];
+        let payload = &seg[1..];
+
+        match kind {
+            0 => {
+                // L2 message
+                decode_l2_message(payload)?;
+            }
+            1 => {
+                // L2 message, brotli-compressed
+                if let Some(decompressed) = try_brotli_decompress(payload) {
+                    decode_l2_message(&decompressed)?;
+                } else {
+                    println!("Segment {}: failed to brotli-decompress L2 message", i);
+                }
+            }
+            2 => {
+                // delayed messages pointer; optional to resolve
+                println!("Segment {}: delayed messages pointer (ignored for now)", i);
+            }
+            other => {
+                println!("Segment {}: unknown kind {}, raw {}", i, other, hex::encode(seg));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_l2_message(msg: &[u8]) -> eyre::Result<()> {
+    if msg.is_empty() {
+        eyre::bail!("Empty L2 message");
+    }
+    let kind = msg[0];
+    let payload = &msg[1..];
+
+    match kind {
+        0x04 => {
+            println!("L2 message kind=SignedTx (0x04), len={}", payload.len());
+            // Do not force EIP-1559; try a general decoder.
+            // Option A: Attempt alloy's general envelope decoding (legacy/2930/1559).
+            // If not readily available, start by logging and saving the tx for offline decode.
+            // Example placeholder:
+            // match decode_eth_tx_envelope(payload) { ... }
+
+            // For now, just log the first bytes and optionally persist:
+            println!("SignedTx first 64: {}", hex::encode(&payload[..64.min(payload.len())]));
+            // save_raw_bytes_to_file("l2_signed_tx.bin", payload.to_vec())?;
+        }
+        0x03 => {
+            println!("L2 message kind=Batch (0x03), nested frames");
+            let mut cursor = payload;
+            let mut idx = 0usize;
+            while cursor.len() >= 8 {
+                let len = u64::from_be_bytes(cursor[0..8].try_into().unwrap()) as usize;
+                cursor = &cursor[8..];
+                if cursor.len() < len {
+                    eyre::bail!("Frame length exceeds remaining buffer");
+                }
+                let frame = &cursor[..len];
+                cursor = &cursor[len..];
+
+                println!("Nested frame {}: {} bytes", idx, len);
+                decode_l2_message(frame)?;
+                idx += 1;
+            }
+            if !cursor.is_empty() {
+                println!("Trailing {} bytes after frames (ignored)", cursor.len());
+            }
+        }
+        0x09 => {
+            println!("L2 message kind=synthetic delayed (0x09); ignoring");
+        }
+        other => {
+            println!("Unknown L2 message kind=0x{:02x}, payload first 32 {}", other, hex::encode(&payload[..32.min(payload.len())]));
+        }
+    }
+    Ok(())
+}
+
+fn handle_raw_blob(raw_blob: &[u8]) -> Result<()> {
+    println!("raw_blob length: {}", raw_blob.len());
+    println!("raw_blob first 64 bytes: {}", hex::encode(&raw_blob[..64.min(raw_blob.len())]));
+    
+    if let Some(&first) = raw_blob.first() {
+        if (first & 0x80) != 0 {
+            println!("Detected DAS/Anytrust header (0x80) flag.");
+
+            if raw_blob.len() < 65 {
+                eyre::bail!("raw_blob too short for DAS/Anytrust header");
+            }
+            let _keyset_hash = &raw_blob[1..33]; // Not needed to decode the payload
+            let data_hash = &raw_blob[33..65];
+
+            // Fetch from DAC using data_hash, then base64-encode 
+            //decode_nitro_batch(&payload);
+            println!("DAC not implemented yet!");
+            return Ok(());
+        } else if first == 0x00 {
+            println!("Detected Nitro brotli header (0x00). Decompressing the body");
+            let compressed = &raw_blob[1..];
+            if let Some(decompressed) = try_brotli_decompress(compressed) {
+                println!("Decompressed Brotli payload length: {}", decompressed.len());
+                decode_nitro_batch(&decompressed)?;
+                return Ok(());
+            } else {
+                eyre::bail!("Brotli decompression failed");
+            }
+        } else {
+            // Unknown at top; probe in order
+            println!("No explicit Nitro header; Probing RLP and Brotli Paths...");
+
+            if let Some(segments) = try_decode_rlp_segments(raw_blob) {
+                println!("RLP Segment stream detected (raw). Segment count: {}", segments.len());
+                handle_segments(segments)?;
+                return Ok(());
+            }
+
+            if let Some(decompressed) = try_brotli_decompress(raw_blob) {
+                println!("Brotli compressed payload detected (raw). Decompressing...");
+                if let Some(segments) = try_decode_rlp_segments(&decompressed) {
+                    println!("RLP Segment stream detected (raw). Segment count: {}", segments.len());
+                    handle_segments(segments)?;
+                    return Ok(());
+                }
+            }
+
+            if first == 0x03 || first == 0x04 || first == 0x09 {
+                println!("Likely at L2 message boundary; parsing L2 message directly...");
+                decode_l2_message(raw_blob)?;
+                return Ok(());
+            }
+
+            eyre::bail!("Could not classify blob by header/probes. Share first 128 bytes for more triage.");
+        }
+    } else {
+        eyre::bail!("Empty blob");
+    }
+    
 }
 
 /// Parse a Nitro batch payload.  
@@ -448,27 +699,29 @@ async fn main() -> Result<()> {
                         for blob in blobs.as_array().unwrap() {
                             // ---- fetch the raw 4844 blob ---------------
                             let data_storage_ref = blob.get("dataStorageReferences").unwrap();
-                            println!("data_storage_ref: {:#?}", &data_storage_ref);
+                            // println!("data_storage_ref: {:#?}", &data_storage_ref);
                             let url = data_storage_ref.get(0).unwrap().get("url").unwrap().as_str().unwrap().to_string();
-                            println!("url: {}", &url);
+                            // println!("url: {}", &url);
                             let response = reqwest::get(&url).await?;
                             let raw_blob: Vec<u8> = response.bytes().await?.to_vec();
                             // println!("blob_data: {:#?}", &blob_data[..64]);
 
+                            // println!("First bytes of raw blob : {}", hex::encode(&raw_blob));
+                            save_bytes_to_file("raw_blob_1.txt", raw_blob.clone());
                             println!("trying to decompress the data using brotli");
                             
                             // The 4844 blob is usually raw; we keep the helper in case a provider returns
                             // a compressed blob directly.
-                            let raw_blob = match try_brotli_decompress(&raw_blob) {
-                                Some(decompressed) => {
-                                    println!("Blob was Brotli compressed, decompressed to {} bytes", decompressed.len());
-                                    decompressed
-                                }
-                                None => {
-                                    println!("Blob is raw (not Brotli). First 64 bytes: {}", hex::encode(&raw_blob[..64.min(raw_blob.len())]));
-                                    raw_blob
-                                }
-                            };
+                            // let raw_blob = match try_brotli_decompress(&raw_blob) {
+                            //     Some(decompressed) => {
+                            //         println!("Blob was Brotli compressed, decompressed to {} bytes", decompressed.len());
+                            //         decompressed
+                            //     }
+                            //     None => {
+                            //         println!("Blob is raw (not Brotli). First 64 bytes: {}", hex::encode(&raw_blob[..64.min(raw_blob.len())]));
+                            //         raw_blob
+                            //     }
+                            // };
                             // ---- compute and compare KZG commitment ----
                             match compute_kzg_commitment(&raw_blob) {
                                 Some(commitment) => {
@@ -486,30 +739,10 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                             }
-                            // ---- Extract the inner payload (Nitro batch or plain tx list) ----
-                            let inner_payload = extract_payload_from_4844_blob(&raw_blob)?;
-                            if let Some(&first) = inner_payload.first() {
-                                println!("inner_payload first byte!: {}", hex::encode([first]));
-                            }
-                            // Choose parser based on the first byte
-                            let frames = if inner_payload.first().map_or(false, |b| *b == 0x0a || *b == 0x0b) {
-                                println!("Detected Nitro flag");
-                                parse_nitro_batch(&inner_payload)?
-                            } else {
-                                println!("No Nitro flag detected treating as raw batch");
-                                decode_raw_batch(&inner_payload)?
-                            };
-
-                            // Decode each transaction
-                            for (i, raw_tx) in frames.iter().enumerate() {
-                                match decode_tx(raw_tx) {
-                                    Ok(envelope) => {
-                                        if let Err(e) = extract_core_fields(&envelope) {
-                                            eprintln!("Tx #{i} – core‑field extraction failed: {e:?}");
-                                        }
-                                    }
-                                    Err(e) => eprintln!("Tx #{i} – decode failed: {e:?}"),
-                                }
+                            // ---- Decode end-to-end according to Nitro/DAS flow ----
+                            if let Err(e) = handle_raw_blob(&raw_blob) {
+                                eprintln!("handle_raw_blob failed: {e:?}");
+                                continue;
                             }
                         }
 

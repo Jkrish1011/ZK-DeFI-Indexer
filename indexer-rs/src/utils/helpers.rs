@@ -1,37 +1,16 @@
-use alloy::{
-    contract::{ContractInstance, Interface},
-    dyn_abi::DynSolValue,
-    network::{EthereumWallet, TransactionBuilder, NetworkWallet},
-    providers::{Provider, ProviderBuilder, WsConnect},
-    primitives::{address, U256, hex, B256,Log as ETHLog, LogData, FixedBytes, Address, Bytes},
-    rpc::types::{Filter, Log, TransactionRequest, BlockNumberOrTag},
-    signers::local::LocalSigner,
-    sol,
-    sol_types::SolEvent,
-    rlp::Decodable,
-    consensus::{
-        EthereumTxEnvelope,
-        TypedTransaction,
-        Transaction,
-        transaction::{TxEip4844Variant, SignerRecoverable},
-    },
-};
-
 use std::{
-    str::{from_utf8,FromStr},
-    panic,
-    future::Future,
-    fs::read_to_string,
-    path::Path,
-    env,
-    collections::HashSet, 
-    sync::Arc, 
-    time::Duration,
-    io::Read,
+    fs::File,
+    io::{self, Write},
 };
 
-use eyre::Result;
-use serde::{Deserialize, Serialize};
-use reqwest::{Error, Client};
-use brotli::Decompressor;
+use alloy::{
+    primitives::{hex},
+};
+
+pub fn save_bytes_to_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(hex::encode(bytes).as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
 
