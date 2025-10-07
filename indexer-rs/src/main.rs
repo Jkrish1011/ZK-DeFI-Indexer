@@ -162,13 +162,27 @@ fn compute_kzg_commitment(blob: &[u8]) -> Option<String> {
     commitment
 }
 
-fn try_brotli_decompress(blob_data: &[u8]) -> Option<Vec<u8>> {
-    let mut decompressed = Vec::new();
-    let mut reader = Decompressor::new(blob_data, 4096);
-    match reader.read_to_end(&mut decompressed) {
-        Ok(_) => Some(decompressed),
-        Err(e) => None
+// 5) Brotli with fallback to brotli2 (more robust)
+fn try_brotli_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    // First try brotli crate with a large buffer
+    {
+        let mut decompressed = Vec::new();
+        let mut reader = brotli::Decompressor::new(data, 1 << 20);
+        if std::io::Read::read_to_end(&mut reader, &mut decompressed).is_ok() {
+            return Some(decompressed);
+        }
     }
+    // Fallback: brotli2
+    {
+        use brotli2::bufread::BrotliDecoder;
+        let cursor = std::io::Cursor::new(data);
+        let mut decoder = BrotliDecoder::new(cursor);
+        let mut decompressed = Vec::new();
+        if std::io::Read::read_to_end(&mut decoder, &mut decompressed).is_ok() {
+            return Some(decompressed);
+        }
+    }
+    None
 }
 
 // ---- RLP helpers: compute total length of the next RLP item and peel a stream ----
@@ -377,22 +391,28 @@ fn extract_core_fields(tx: &EthereumTxEnvelope<TxEip4844Variant>) -> eyre::Resul
 fn extract_payload_from_4844_blob(blob: &[u8]) -> Result<Vec<u8>> {
     // if length is < 8, treat the whole as the paylod
     if blob.len() < 8 {
+        println!("4844 blob < 8 bytes, returning whole buffer");
         return Ok(blob.to_vec());
     }
 
     //4 - byte version (big-endian) - not under consideration, just read it
-    let _version = u32::from_be_bytes(blob[0..4].try_into().unwrap());
+    let version_be = u32::from_be_bytes(blob[0..4].try_into().unwrap());
 
     //4 - byte size (little-endian) length of the following data
-    let size = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+    let size_le = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+
+    println!("4844 header: version(be)={:#x}, size(le)={}", version_be, size_le);
+
+    let end = 8u64.saturating_add(size_le as u64) as usize;
 
     // check malformed size fields
-    if size == 0 || 8 + size > blob.len() as u32 {
+    if size_le == 0 || end > blob.len() {
+        println!("4844 header size invalid (size={}, end={}, blob={}), using whole unpacked buffer", size_le, end, blob.len());
         // Size field looks wrong - assume it's the whole blob
         return Ok(blob.to_vec());
     }
 
-    return Ok(blob[8..8 + size as usize].to_vec());
+    Ok(blob[8..end].to_vec())
 }
 
 fn decode_nitro_batch(batch: &[u8]) -> eyre::Result<()> {
@@ -490,65 +510,93 @@ fn decode_l2_message(msg: &[u8]) -> eyre::Result<()> {
     Ok(())
 }
 
-fn handle_raw_blob(raw_blob: &[u8]) -> Result<()> {
-    println!("raw_blob length: {}", raw_blob.len());
-    println!("raw_blob first 64 bytes: {}", hex::encode(&raw_blob[..64.min(raw_blob.len())]));
-    
-    if let Some(&first) = raw_blob.first() {
-        if (first & 0x80) != 0 {
-            println!("Detected DAS/Anytrust header (0x80) flag.");
+// Referencing to : https://github.com/OffchainLabs/nitro/blob/master/arbstate/inbox.go#L68-L113:
+// https://github.com/OffchainLabs/nitro/blob/master/daprovider/daclient/daclient.go
+// 7) Main entry for a single blob
+// Pass in the event TimeBounds so we can auto-detect endianness of the 40-byte header
+pub fn handle_raw_blob(
+    raw_blob: &[u8],
+    ev_min_ts: u64,
+    ev_max_ts: u64,
+    ev_min_bn: u64,
+    ev_max_bn: u64,
+) -> eyre::Result<()> {
+    println!("\n=== Processing new blob ===");
+    println!("Raw blob size: {} bytes", raw_blob.len());
 
-            if raw_blob.len() < 65 {
-                eyre::bail!("raw_blob too short for DAS/Anytrust header");
-            }
-            let _keyset_hash = &raw_blob[1..33]; // Not needed to decode the payload
-            let data_hash = &raw_blob[33..65];
+    // Unpack to 126,976 bytes
+    let unpacked = decode_4844_blob(raw_blob)?;
+    println!(
+        "Unpacked payload size: {}",
+        unpacked.len()
+    );
+    println!(
+        "Unpacked first 64 bytes: {}",
+        justHex::encode(&unpacked[..64.min(unpacked.len())])
+    );
 
-            // Fetch from DAC using data_hash, then base64-encode 
-            //decode_nitro_batch(&payload);
-            println!("DAC not implemented yet!");
-            return Ok(());
-        } else if first == 0x00 {
-            println!("Detected Nitro brotli header (0x00). Decompressing the body");
-            let compressed = &raw_blob[1..];
-            if let Some(decompressed) = try_brotli_decompress(compressed) {
-                println!("Decompressed Brotli payload length: {}", decompressed.len());
-                decode_nitro_batch(&decompressed)?;
-                return Ok(());
-            } else {
-                eyre::bail!("Brotli decompression failed");
-            }
-        } else {
-            // Unknown at top; probe in order
-            println!("No explicit Nitro header; Probing RLP and Brotli Paths...");
+    // No 8-byte version+size header for your feed; work on unpacked directly
+    let payload = &unpacked;
 
-            if let Some(segments) = try_decode_rlp_segments(raw_blob) {
-                println!("RLP Segment stream detected (raw). Segment count: {}", segments.len());
-                handle_segments(segments)?;
-                return Ok(());
-            }
+    // Parse the 40-byte header with endian autodetection
+    let (header, batch_data) =
+        parse_header_autodetect(payload, ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn)?;
+    println!("Header: {:?}", header);
 
-            if let Some(decompressed) = try_brotli_decompress(raw_blob) {
-                println!("Brotli compressed payload detected (raw). Decompressing...");
-                if let Some(segments) = try_decode_rlp_segments(&decompressed) {
-                    println!("RLP Segment stream detected (raw). Segment count: {}", segments.len());
-                    handle_segments(segments)?;
-                    return Ok(());
-                }
-            }
-
-            if first == 0x03 || first == 0x04 || first == 0x09 {
-                println!("Likely at L2 message boundary; parsing L2 message directly...");
-                decode_l2_message(raw_blob)?;
-                return Ok(());
-            }
-
-            eyre::bail!("Could not classify blob by header/probes. Share first 128 bytes for more triage.");
-        }
-    } else {
-        eyre::bail!("Empty blob");
+    if batch_data.is_empty() {
+        println!("Empty batch_data after header; skipping blob");
+        return Ok(());
     }
-    
+
+    let flag = batch_data[0];
+    println!("Flag byte after header: 0x{:02x}", flag);
+
+    // AnyTrust/DAS
+    if (flag & 0x80) != 0 {
+        if batch_data.len() < 65 {
+            println!("DAS header too short (<65 bytes); skipping blob");
+            return Ok(());
+        }
+        let keyset_hash = &batch_data[1..33];
+        let data_hash = &batch_data[33..65];
+        println!("DAS cert: keyset_hash=0x{}", justHex::encode(keyset_hash));
+        println!("DAS cert: data_hash  =0x{}", justHex::encode(data_hash));
+        println!("DAC fetch required; stopping for this blob.");
+        return Ok(());
+    }
+
+    // Whole-batch compressed
+    if flag == 0x00 {
+        let compressed = &batch_data[1..];
+        if let Some(decompressed) = try_brotli_decompress(compressed) {
+            println!(
+                "Decompressed whole-batch: {} -> {} bytes",
+                compressed.len(),
+                decompressed.len()
+            );
+            // Try RLP segments first (some stacks encode segments as an RLP string list)
+            if let Some(segs) = try_decode_rlp_segments(&decompressed) {
+                println!("Decoded {} RLP segments (whole-batch)", segs.len());
+                handle_segments(segs)?;
+                return Ok(());
+            }
+            // Otherwise, try to treat the decompressed bytes as nested segment stream
+            if let Err(e) = parse_top_level_segments(&decompressed) {
+                println!("Nested segment stream failed after brotli: {e}");
+            }
+            return Ok(());
+        } else {
+            println!("Brotli decompression failed for whole-batch; skipping blob");
+            return Ok(());
+        }
+    }
+
+    // Non-DAS, non-whole-batch: parse a top-level segment stream
+    if let Err(e) = parse_top_level_segments(batch_data) {
+        println!("Top-level segment stream failed: {e}");
+    }
+
+    Ok(())
 }
 
 /// Parse a Nitro batch payload.  
@@ -637,6 +685,191 @@ fn parse_nitro_batch(payload: &[u8]) -> eyre::Result<Vec<Vec<u8>>> {
 
     println!("Finished parsing – {} transaction(s) extracted", txs.len());
     Ok(txs)
+}
+
+// 1) Lossless unpack: 4096 * 32 → 4096 * 31 (drop one leading pad byte per element)
+fn decode_4844_blob(blob: &[u8]) -> Result<Vec<u8>> {
+    const FIELD_ELEMENT_SIZE: usize = 32;
+    const NUM_ELEMENTS: usize = 4096;
+    const BYTES_PER_ELEMENT: usize = 31;
+
+    if blob.len() != FIELD_ELEMENT_SIZE * NUM_ELEMENTS {
+        eyre::bail!("Expected 131072-byte blob, got {}", blob.len());
+    }
+
+    let mut output = Vec::with_capacity(NUM_ELEMENTS * BYTES_PER_ELEMENT);
+    for i in 0..NUM_ELEMENTS {
+        let start = i * FIELD_ELEMENT_SIZE;
+        let element = &blob[start..start + FIELD_ELEMENT_SIZE];
+        output.extend_from_slice(&element[1..FIELD_ELEMENT_SIZE]);
+    }
+
+    println!(
+        "Decoded 4844 blob: {} -> {} bytes",
+        blob.len(),
+        output.len()
+    );
+    Ok(output)
+}
+
+
+#[derive(Debug)]
+struct BatchHeader {
+    min_timestamp: u64,
+    max_timestamp: u64,
+    min_block_number: u64,
+    max_block_number: u64,
+    after_delayed_count: u64,
+}
+
+/// Parse the 40-byte batch header that precedes the actual batch payload
+fn parse_batch_header(data: &[u8]) -> Result<(BatchHeader, &[u8])> {
+    if data.len() < 40 {
+        eyre::bail!("Data too short for batch header: {} bytes", data.len());
+    }
+    
+    let header = BatchHeader {
+        min_timestamp: u64::from_be_bytes(data[0..8].try_into().unwrap()),
+        max_timestamp: u64::from_be_bytes(data[8..16].try_into().unwrap()),
+        min_block_number: u64::from_be_bytes(data[16..24].try_into().unwrap()),
+        max_block_number: u64::from_be_bytes(data[24..32].try_into().unwrap()),
+        after_delayed_count: u64::from_be_bytes(data[32..40].try_into().unwrap()),
+    };
+    
+    println!("Batch header parsed:");
+    println!("  MinTimestamp: {}", header.min_timestamp);
+    println!("  MaxTimestamp: {}", header.max_timestamp);
+    println!("  MinBlockNumber: {}", header.min_block_number);
+    println!("  MaxBlockNumber: {}", header.max_block_number);
+    println!("  AfterDelayedCount: {}", header.after_delayed_count);
+    
+    Ok((header, &data[40..]))
+}
+
+// 2) Parse 40-byte Nitro TimeBounds header (BE)
+fn parse_batch_header_be(data: &[u8]) -> eyre::Result<(BatchHeader, &[u8])> {
+    if data.len() < 40 {
+        eyre::bail!("Data too short for batch header: {} bytes", data.len());
+    }
+    let header = BatchHeader {
+        min_timestamp: u64::from_be_bytes(data[0..8].try_into().unwrap()),
+        max_timestamp: u64::from_be_bytes(data[8..16].try_into().unwrap()),
+        min_block_number: u64::from_be_bytes(data[16..24].try_into().unwrap()),
+        max_block_number: u64::from_be_bytes(data[24..32].try_into().unwrap()),
+        after_delayed_count: u64::from_be_bytes(data[32..40].try_into().unwrap()),
+    };
+    Ok((header, &data[40..]))
+}
+
+// 3) Parse 40-byte Nitro TimeBounds header (LE)
+fn parse_batch_header_le(data: &[u8]) -> eyre::Result<(BatchHeader, &[u8])> {
+    if data.len() < 40 {
+        eyre::bail!("Data too short for batch header: {} bytes", data.len());
+    }
+    let header = BatchHeader {
+        min_timestamp: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+        max_timestamp: u64::from_le_bytes(data[8..16].try_into().unwrap()),
+        min_block_number: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+        max_block_number: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+        after_delayed_count: u64::from_le_bytes(data[32..40].try_into().unwrap()),
+    };
+    Ok((header, &data[40..]))
+}
+
+// 4) Auto-detect endianness by comparing to the event's TimeBounds (pick the closer match)
+fn parse_header_autodetect<'a>(
+    data: &'a [u8],
+    ev_min_ts: u64,
+    ev_max_ts: u64,
+    ev_min_bn: u64,
+    ev_max_bn: u64,
+) -> eyre::Result<(BatchHeader, &'a [u8])> {
+    let be = parse_batch_header_be(data);
+    let le = parse_batch_header_le(data);
+
+    // score closeness to event
+    fn score(h: &BatchHeader, ev: (u64, u64, u64, u64)) -> u128 {
+        let (mts, xts, mb, xb) = ev;
+        (h.min_timestamp as i128 - mts as i128).unsigned_abs() as u128
+            + (h.max_timestamp as i128 - xts as i128).unsigned_abs() as u128
+            + (h.min_block_number as i128 - mb as i128).unsigned_abs() as u128
+            + (h.max_block_number as i128 - xb as i128).unsigned_abs() as u128
+    }
+
+    match (be, le) {
+        (Ok((hb, rb)), Ok((hl, rl))) => {
+            let ev = (ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn);
+            let sb = score(&hb, ev);
+            let sl = score(&hl, ev);
+            if sl < sb {
+                Ok((hl, rl))
+            } else {
+                Ok((hb, rb))
+            }
+        }
+        (Ok(v), Err(_)) => Ok(v),
+        (Err(_), Ok(v)) => Ok(v),
+        (Err(e1), Err(_e2)) => Err(e1),
+    }
+}
+
+// 6) Existing helpers you already have (rlp_peel_string, try_decode_rlp_segments, decode_l2_message, handle_segments) remain unchanged.
+// Below is a new top-level segment parser that many Nitro batches use directly after the 40-byte header.
+
+// kind (1 byte) + length (8 bytes, big-endian) + payload (len bytes)
+fn parse_top_level_segments(batch_data: &[u8]) -> eyre::Result<()> {
+    if batch_data.is_empty() {
+        return Ok(());
+    }
+    let flag = batch_data[0];
+    println!("Top-level segments: flag=0x{:02x}", flag);
+
+    let mut cursor = &batch_data[1..];
+    while cursor.len() >= 9 {
+        let kind = cursor[0];
+        let len = u64::from_be_bytes(cursor[1..9].try_into().unwrap()) as usize;
+        cursor = &cursor[9..];
+        if cursor.len() < len {
+            println!(
+                "Segment claims len={}, but only {} remain. Stopping this blob.",
+                len,
+                cursor.len()
+            );
+            break;
+        }
+        let seg = &cursor[..len];
+        cursor = &cursor[len..];
+
+        match kind {
+            0x00 => {
+                // Uncompressed L2 message
+                println!("Segment kind=0x00 (L2 message), len={}", len);
+                if let Err(e) = decode_l2_message(seg) {
+                    println!("L2 message decode failed: {e}");
+                }
+            }
+            0x01 => {
+                // Brotli-compressed L2 message
+                println!("Segment kind=0x01 (L2 brotli), len={}", len);
+                if let Some(decompressed) = try_brotli_decompress(seg) {
+                    if let Err(e) = decode_l2_message(&decompressed) {
+                        println!("L2 message (after brotli) decode failed: {e}");
+                    }
+                } else {
+                    println!("Brotli failed on L2 segment (kind=0x01)");
+                }
+            }
+            0x02 => {
+                // Delayed messages pointer
+                println!("Segment kind=0x02 (delayed pointer), len={}", len);
+            }
+            other => {
+                println!("Unknown segment kind=0x{:02x}, len={}", other, len);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -739,10 +972,16 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                             }
-                            // ---- Decode end-to-end according to Nitro/DAS flow ----
-                            if let Err(e) = handle_raw_blob(&raw_blob) {
-                                eprintln!("handle_raw_blob failed: {e:?}");
-                                continue;
+                            // Given `event.timeBounds` from the log decode:
+                            let ev_min_ts = event.timeBounds.minTimestamp as u64;
+                            let ev_max_ts = event.timeBounds.maxTimestamp as u64;
+                            let ev_min_bn = event.timeBounds.minBlockNumber as u64;
+                            let ev_max_bn = event.timeBounds.maxBlockNumber as u64;
+
+                            // For each raw_blob bytes you fetched:
+                            if let Err(e) = handle_raw_blob(&raw_blob, ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn) {
+                                // Do NOT abort your outer loop; just log and continue
+                                eprintln!("handle_raw_blob failed for this blob: {e}");
                             }
                         }
 
