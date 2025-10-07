@@ -817,6 +817,69 @@ fn parse_header_autodetect<'a>(
 // Below is a new top-level segment parser that many Nitro batches use directly after the 40-byte header.
 
 // kind (1 byte) + length (8 bytes, big-endian) + payload (len bytes)
+fn plausible_kind(byte: u8) -> bool {
+    matches!(byte, 0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x09)
+}
+
+#[derive(Clone, Copy)]
+enum LenCodec {
+    U64Be,
+    U64Le,
+    U32Be,
+    U32Le,
+}
+
+fn try_take_segment<'a>(mut buf: &'a [u8]) -> Option<((u8, usize), &'a [u8])> {
+    // Try each header shape at this exact position
+    for codec in [LenCodec::U64Be, LenCodec::U64Le, LenCodec::U32Be, LenCodec::U32Le] {
+        if let Some((k, len, rest)) = try_header(buf, codec) {
+            return Some(((k, len), rest));
+        }
+    }
+    None
+}
+
+fn try_header<'a>(buf: &'a [u8], codec: LenCodec) -> Option<(u8, usize, &'a [u8])> {
+    match codec {
+        LenCodec::U64Be => {
+            if buf.len() < 9 { return None; }
+            let k = buf[0];
+            let len = u64::from_be_bytes(buf[1..9].try_into().ok()?) as usize;
+            if !plausible_kind(k) || len == 0 { return None; }
+            let rest = &buf[9..];
+            if rest.len() < len { return None; }
+            Some((k, len, rest))
+        }
+        LenCodec::U64Le => {
+            if buf.len() < 9 { return None; }
+            let k = buf[0];
+            let len = u64::from_le_bytes(buf[1..9].try_into().ok()?) as usize;
+            if !plausible_kind(k) || len == 0 { return None; }
+            let rest = &buf[9..];
+            if rest.len() < len { return None; }
+            Some((k, len, rest))
+        }
+        LenCodec::U32Be => {
+            if buf.len() < 5 { return None; }
+            let k = buf[0];
+            let len = u32::from_be_bytes(buf[1..5].try_into().ok()?) as usize;
+            if !plausible_kind(k) || len == 0 { return None; }
+            let rest = &buf[5..];
+            if rest.len() < len { return None; }
+            Some((k, len, rest))
+        }
+        LenCodec::U32Le => {
+            if buf.len() < 5 { return None; }
+            let k = buf[0];
+            let len = u32::from_le_bytes(buf[1..5].try_into().ok()?) as usize;
+            if !plausible_kind(k) || len == 0 { return None; }
+            let rest = &buf[5..];
+            if rest.len() < len { return None; }
+            Some((k, len, rest))
+        }
+    }
+}
+
 fn parse_top_level_segments(batch_data: &[u8]) -> eyre::Result<()> {
     if batch_data.is_empty() {
         return Ok(());
@@ -825,47 +888,83 @@ fn parse_top_level_segments(batch_data: &[u8]) -> eyre::Result<()> {
     println!("Top-level segments: flag=0x{:02x}", flag);
 
     let mut cursor = &batch_data[1..];
-    while cursor.len() >= 9 {
-        let kind = cursor[0];
-        let len = u64::from_be_bytes(cursor[1..9].try_into().unwrap()) as usize;
-        cursor = &cursor[9..];
-        if cursor.len() < len {
-            println!(
-                "Segment claims len={}, but only {} remain. Stopping this blob.",
-                len,
-                cursor.len()
-            );
-            break;
-        }
-        let seg = &cursor[..len];
-        cursor = &cursor[len..];
 
-        match kind {
-            0x00 => {
-                // Uncompressed L2 message
-                println!("Segment kind=0x00 (L2 message), len={}", len);
-                if let Err(e) = decode_l2_message(seg) {
-                    println!("L2 message decode failed: {e}");
-                }
-            }
-            0x01 => {
-                // Brotli-compressed L2 message
-                println!("Segment kind=0x01 (L2 brotli), len={}", len);
-                if let Some(decompressed) = try_brotli_decompress(seg) {
-                    if let Err(e) = decode_l2_message(&decompressed) {
-                        println!("L2 message (after brotli) decode failed: {e}");
+    // Keep decoding segments until we exhaust the buffer
+    while !cursor.is_empty() {
+        // First try at current position
+        if let Some(((kind, len), rest_after_header)) = try_take_segment(cursor) {
+            // Read segment bytes and advance
+            let (seg, rest_after_seg) = rest_after_header.split_at(len);
+            match kind {
+                0x00 => {
+                    println!("Segment kind=0x00 (L2), len={}", len);
+                    if let Err(e) = decode_l2_message(seg) {
+                        println!("L2 message decode failed: {e}");
                     }
-                } else {
-                    println!("Brotli failed on L2 segment (kind=0x01)");
+                }
+                0x01 => {
+                    println!("Segment kind=0x01 (L2 brotli), len={}", len);
+                    if let Some(decompressed) = try_brotli_decompress(seg) {
+                        if let Err(e) = decode_l2_message(&decompressed) {
+                            println!("L2 message (after brotli) decode failed: {e}");
+                        }
+                    } else {
+                        println!("Brotli failed on L2 segment (kind=0x01)");
+                    }
+                }
+                0x02 => {
+                    println!("Segment kind=0x02 (delayed pointer), len={}", len);
+                }
+                other => {
+                    println!("Unknown segment kind=0x{:02x}, len={}", other, len);
                 }
             }
-            0x02 => {
-                // Delayed messages pointer
-                println!("Segment kind=0x02 (delayed pointer), len={}", len);
+            cursor = rest_after_seg;
+            continue;
+        }
+
+        // If no header shape matched, scan forward up to 32 bytes to resync
+        let mut advanced = false;
+        for skip in 1..=32.min(cursor.len()) {
+            if let Some(((kind, len), rest_after_header)) = try_take_segment(&cursor[skip..]) {
+                println!("Resynced after skipping {} byte(s)", skip);
+                // consume the skipped bytes + header+payload in one go
+                let (seg, rest_after_seg) = rest_after_header.split_at(len);
+                match kind {
+                    0x00 => {
+                        println!("Segment kind=0x00 (L2), len={}", len);
+                        if let Err(e) = decode_l2_message(seg) {
+                            println!("L2 message decode failed: {e}");
+                        }
+                    }
+                    0x01 => {
+                        println!("Segment kind=0x01 (L2 brotli), len={}", len);
+                        if let Some(decompressed) = try_brotli_decompress(seg) {
+                            if let Err(e) = decode_l2_message(&decompressed) {
+                                println!("L2 message (after brotli) decode failed: {e}");
+                            }
+                        } else {
+                            println!("Brotli failed on L2 segment (kind=0x01)");
+                        }
+                    }
+                    0x02 => {
+                        println!("Segment kind=0x02 (delayed pointer), len={}", len);
+                    }
+                    other => {
+                        println!("Unknown segment kind=0x{:02x}, len={}", other, len);
+                    }
+                }
+                // We consumed: skip + header + len; reconstruct remaining cursor:
+                let consumed = skip + (cursor[skip..].len() - rest_after_header.len()) + len;
+                cursor = &cursor[consumed..];
+                advanced = true;
+                break;
             }
-            other => {
-                println!("Unknown segment kind=0x{:02x}, len={}", other, len);
-            }
+        }
+
+        if !advanced {
+            println!("Could not find a plausible segment header; stopping this blob.");
+            break;
         }
     }
 
@@ -973,15 +1072,15 @@ async fn main() -> Result<()> {
                                 }
                             }
                             // Given `event.timeBounds` from the log decode:
-                            let ev_min_ts = event.timeBounds.minTimestamp as u64;
-                            let ev_max_ts = event.timeBounds.maxTimestamp as u64;
-                            let ev_min_bn = event.timeBounds.minBlockNumber as u64;
-                            let ev_max_bn = event.timeBounds.maxBlockNumber as u64;
+                            let ev = &event.timeBounds;
+                            let ev_min_ts = ev.minTimestamp as u64;
+                            let ev_max_ts = ev.maxTimestamp as u64;
+                            let ev_min_bn = ev.minBlockNumber as u64;
+                            let ev_max_bn = ev.maxBlockNumber as u64;
 
-                            // For each raw_blob bytes you fetched:
                             if let Err(e) = handle_raw_blob(&raw_blob, ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn) {
-                                // Do NOT abort your outer loop; just log and continue
-                                eprintln!("handle_raw_blob failed for this blob: {e}");
+                                // Do not stop the main loop
+                                eprintln!("handle_raw_blob failed: {e}");
                             }
                         }
 
