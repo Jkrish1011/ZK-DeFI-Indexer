@@ -8,8 +8,10 @@ use alloy::{
     signers::local::LocalSigner,
     sol,
     sol_types::SolEvent,
+    eips::eip4844::kzg_to_versioned_hash,
     rlp::{Decodable, Encodable},
     consensus::{
+        Bytes48,
         EthereumTxEnvelope,
         TypedTransaction,
         Transaction,
@@ -51,10 +53,14 @@ use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
 use reqwest::{Error, Client};
 use brotli::Decompressor;
+use clap::Parser;
 
 mod utils;
+mod arbitrum;
+
 
 use utils::helpers::save_bytes_to_file;
+use arbitrum::ArbitrumParser;
 
 sol! {
     #[allow(missing_docs)]
@@ -1072,16 +1078,18 @@ async fn main() -> Result<()> {
                                 }
                             }
                             // Given `event.timeBounds` from the log decode:
-                            let ev = &event.timeBounds;
-                            let ev_min_ts = ev.minTimestamp as u64;
-                            let ev_max_ts = ev.maxTimestamp as u64;
-                            let ev_min_bn = ev.minBlockNumber as u64;
-                            let ev_max_bn = ev.maxBlockNumber as u64;
+                            // let ev = &event.timeBounds;
+                            // let ev_min_ts = ev.minTimestamp as u64;
+                            // let ev_max_ts = ev.maxTimestamp as u64;
+                            // let ev_min_bn = ev.minBlockNumber as u64;
+                            // let ev_max_bn = ev.maxBlockNumber as u64;
 
-                            if let Err(e) = handle_raw_blob(&raw_blob, ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn) {
-                                // Do not stop the main loop
-                                eprintln!("handle_raw_blob failed: {e}");
-                            }
+                            // if let Err(e) = handle_raw_blob(&raw_blob, ev_min_ts, ev_max_ts, ev_min_bn, ev_max_bn) {
+                            //     // Do not stop the main loop
+                            //     eprintln!("handle_raw_blob failed: {e}");
+                            // }
+
+                            ArbitrumParser(raw_blob.clone()).await?;
                         }
 
                     }
